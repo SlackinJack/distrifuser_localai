@@ -1,3 +1,5 @@
+# https://github.com/xdit-project/xDiT/blob/1c31746e2f903e791bc2a41a0bc23614958e46cd/comfyui-xdit/host.py
+
 import argparse
 import os
 import time
