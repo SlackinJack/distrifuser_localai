@@ -120,9 +120,9 @@ class BackendServicer(backend_pb2_grpc.BackendServicer):
 
             # pipeline_type = "SDXL"
             if "sdxl" in self.last_model_path.lower() or \
-               "sd_xl" in self.last_model_path.lower() or \
-               "sd-xl" in self.last_model_path.lower() or \
-               "sd xl" in self.last_model_path.lower() or \
+               "_xl" in self.last_model_path.lower() or \
+               "-xl" in self.last_model_path.lower() or \
+               " xl" in self.last_model_path.lower() or \
                "XL" in self.last_model_path:
                 pipeline_type = "SDXL"
             else:
