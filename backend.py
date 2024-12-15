@@ -129,8 +129,8 @@ class BackendServicer(backend_pb2_grpc.BackendServicer):
                 pipeline_type = "SD"
 
             scheduler = self.last_scheduler
-            if scheduler == "dpmpp_2m":
-                scheduler = "dpm-solver"
+            if scheduler is None or len(scheduler) == 0:
+                scheduler = "dpmpp_2m"
 
             cmd = [
                 'torchrun',
@@ -174,29 +174,32 @@ class BackendServicer(backend_pb2_grpc.BackendServicer):
             self.is_loaded = True
             self.needs_reload = False
 
-        url = 'http://localhost:6000/generate'
-        data = {
-            "prompt": request.positive_prompt,
-            "negative_prompt": request.negative_prompt,
-            "num_inference_steps": request.step,
-            "seed": request.seed,
-            "cfg": self.last_cfg_scale
-        }
-        if request.negative_prompt and len(request.negative_prompt) > 0:
-            data["negative_prompt"] = request.negative_prompt
-        response = requests.post(url, json=data)
-        response_data = response.json()
-        output_base64 = response_data.get("output", "")
-        if output_base64:
-            output_bytes = base64.b64decode(output_base64)
-            output = pickle.loads(output_bytes)
+        if self.is_loaded:
+            url = 'http://localhost:6000/generate'
+            data = {
+                "prompt": request.positive_prompt,
+                "negative_prompt": request.negative_prompt,
+                "num_inference_steps": request.step,
+                "seed": request.seed,
+                "cfg": self.last_cfg_scale
+            }
+            if request.negative_prompt and len(request.negative_prompt) > 0:
+                data["negative_prompt"] = request.negative_prompt
+            response = requests.post(url, json=data)
+            response_data = response.json()
+            output_base64 = response_data.get("output", "")
+            if output_base64:
+                output_bytes = base64.b64decode(output_base64)
+                output = pickle.loads(output_bytes)
+            else:
+                output = None
+                kill_process()
+                assert False, "No output object received"
+            images = output.images
+            images[0].save(request.dst)
+            return backend_pb2.Result(message="Media generated", success=True)
         else:
-            output = None
-            kill_process()
-            assert False, "No output object received"
-        images = output.images
-        images[0].save(request.dst)
-        return backend_pb2.Result(message="Media generated", success=True)
+            return backend_pb2.Result(message="Host is not loaded", success=False)
 
 
 def serve(address):

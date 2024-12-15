@@ -14,7 +14,7 @@ from compel import Compel, ReturnedEmbeddingsType
 
 from PIL import Image
 from flask import Flask, request, jsonify
-from diffusers.schedulers import (DDIMScheduler, DPMSolverMultistepScheduler, EulerDiscreteScheduler)
+from diffusers.schedulers import DDIMScheduler, DPMSolverMultistepScheduler, EulerDiscreteScheduler
 from distrifuser.utils import DistriConfig
 from distrifuser.pipelines import DistriSDPipeline, DistriSDXLPipeline
 
@@ -47,7 +47,7 @@ def get_args() -> argparse.Namespace:
     # parser.add_argument("--output_path", type=str, default=None)
     parser.add_argument("--num_inference_steps", type=int, default=50, help="Number of inference steps")
     parser.add_argument("--guidance_scale", type=float, default=5.0)
-    parser.add_argument("--scheduler", type=str, default="dpm-solver", choices=["euler", "dpm-solver", "ddim"])
+    parser.add_argument("--scheduler", type=str, default="dpmpp_2m", choices=["euler", "dpmpp_2m", "ddim"])
     parser.add_argument("--seed", type=int, default=1234, help="Random seed")
 
     # DistriFuser specific arguments
@@ -145,7 +145,7 @@ def initialize():
     assert args.model_path is not None, "No model specified"
     if args.scheduler == "euler":
         scheduler = EulerDiscreteScheduler.from_pretrained(args.model_path, subfolder="scheduler")
-    elif args.scheduler == "dpm-solver":
+    elif args.scheduler == "dpmpp_2m":
         scheduler = DPMSolverMultistepScheduler.from_pretrained(args.model_path, subfolder="scheduler")
     elif args.scheduler == "ddim":
         scheduler = DDIMScheduler.from_pretrained(args.model_path, subfolder="scheduler")
@@ -153,13 +153,6 @@ def initialize():
         raise NotImplementedError
 
     assert args.variant in ["fp16", "fp32"], "Unsupported variant"
-    if args.variant == "fp16":
-        torchType = torch.float16
-        #variant = "fp16"
-        variant = None
-    else:
-        torchType = torch.float32
-        variant = None
 
     assert args.pipeline_type in ["SD", "SDXL"], "Unsupported pipeline"
     if args.pipeline_type == "SDXL":
@@ -170,8 +163,7 @@ def initialize():
     pipe = PipelineClass.from_pretrained(
         pretrained_model_name_or_path=args.model_path,
         distri_config=distri_config,
-        torch_dtype=torchType,
-        variant=variant,
+        torch_dtype=torch.float16 if args.variant == "fp16" else torch.float32,
         use_safetensors=True,
         scheduler=scheduler,
     )
@@ -206,6 +198,7 @@ def generate_image_parallel(
     torch.cuda.reset_peak_memory_stats()
     start_time = time.time()
     args = get_args()
+
     positive_prompt_embeds = None
     positive_pooled_prompt_embeds = None
     negative_prompt_embeds = None
@@ -220,6 +213,7 @@ def generate_image_parallel(
         positive_prompt_embeds, positive_pooled_prompt_embeds = compel([positive_prompt])
         if len(negative_prompt) > 0:
             negative_prompt_embeds, negative_pooled_prompt_embeds = compel([negative_prompt])
+    
     output = pipe(
         prompt=positive_prompt if positive_prompt_embeds is None else None,
         negative_prompt=negative_prompt if negative_prompt_embeds is None else None,
