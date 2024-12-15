@@ -4,11 +4,9 @@ import backend_pb2
 import backend_pb2_grpc
 import base64
 import grpc
-import logging
-import numpy
+# import json
 import os
 import pickle
-import random
 import requests
 import signal
 import subprocess
@@ -18,33 +16,17 @@ import torch
 from concurrent import futures
 from pathlib import Path
 from PIL import Image
-from torchvision import transforms
-from torchvision.transforms import ToTensor
 
 
 _ONE_DAY_IN_SECONDS = 60 * 60 * 24
+COMPEL = os.environ.get("COMPEL", "0") == "1"
 
 
 # If MAX_WORKERS are specified in the environment use it, otherwise default to 1
 MAX_WORKERS = int(os.environ.get('PYTHON_GRPC_MAX_WORKERS', '1'))
 
 
-logger = None
 process = None
-
-
-def convert_images_to_tensors(images: list[Image.Image]):
-    return torch.stack([numpy.transpose(ToTensor()(image), (1, 2, 0)) for image in images])
-
-
-def setup_logger():
-    global logger
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s - %(levelname)s - %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
-    logger = logging.getLogger(__name__)
 
 
 def kill_process():
@@ -63,6 +45,8 @@ class BackendServicer(backend_pb2_grpc.BackendServicer):
     variant = "fp32"
     is_loaded = False
     needs_reload = False
+    # last_lora_adapters = []
+    # loras = {}
 
 
     def Health(self, request, context):
@@ -70,8 +54,6 @@ class BackendServicer(backend_pb2_grpc.BackendServicer):
 
 
     def LoadModel(self, request, context):
-        setup_logger()
-
         if request.CFGScale != 0 and self.last_cfg_scale != request.CFGScale:
             self.needs_reload = True
             self.last_cfg_scale = request.CFGScale
@@ -101,7 +83,26 @@ class BackendServicer(backend_pb2_grpc.BackendServicer):
                 self.last_scheduler = request.SchedulerType
             else:
                 kill_process()
-                assert False, "Invalid scheduler type"
+                assert False, "Unsupported scheduler type"
+
+        # if request.LoraAdapters:
+        #     if len(self.last_lora_adapters) == 0 and len(request.LoraAdapters) == 0:
+        #         pass
+        #     elif len(self.last_lora_adapters) != len(request.LoraAdapters):
+        #         self.needs_reload = True
+        #     else:
+        #         for adapter in self.last_lora_adapters:
+        #             if adapter not in request.LoraAdapters:
+        #                 self.needs_reload = True
+        #                 break
+        #     if self.needs_reload:
+        #         self.loras = {}
+        #         self.last_lora_adapters = request.LoraAdapters
+        #         if len(request.LoraAdapters) > 0:
+        #             i = 0
+        #             for adapter in request.LoraAdapters:
+        #                 self.loras[adapter] = request.LoraScales[i]
+        #                i += 1
 
         return backend_pb2.Result(message="", success=True)
 
@@ -117,15 +118,15 @@ class BackendServicer(backend_pb2_grpc.BackendServicer):
             self.last_height = request.height
             self.last_width = request.width
 
-            pipeline_type = "SDXL"
-            # if "sdxl" in self.last_model_path.lower() or \
-            #    "sd_xl" in self.last_model_path.lower() or \
-            #    "sd-xl" in self.last_model_path.lower() or \
-            #    "sd xl" in self.last_model_path.lower() or \
-            #    "XL" in self.last_model_path:
-            #     pipeline_type = "SDXL"
-            # else:
-            #     pipeline_type = "SD"
+            # pipeline_type = "SDXL"
+            if "sdxl" in self.last_model_path.lower() or \
+               "sd_xl" in self.last_model_path.lower() or \
+               "sd-xl" in self.last_model_path.lower() or \
+               "sd xl" in self.last_model_path.lower() or \
+               "XL" in self.last_model_path:
+                pipeline_type = "SDXL"
+            else:
+                pipeline_type = "SD"
 
             scheduler = self.last_scheduler
             if scheduler == "dpmpp_2m":
@@ -143,9 +144,16 @@ class BackendServicer(backend_pb2_grpc.BackendServicer):
                 f'--scheduler={scheduler}',
                 f'--guidance_scale={self.last_cfg_scale}',
                 f'--no_cuda_graph',
+                f'--no_split_batch',
             ]
+
+            if COMPEL:
+                cmd.append('--compel')
+
+            # if len(self.loras) > 0:
+            #     cmd.append(f'--lora={json.dumps(self.loras)}')
+
             cmd = [arg for arg in cmd if arg]
-            logger.info("Running command:", " ".join(cmd))
             global process
             process = subprocess.Popen(cmd)
             host = 'http://localhost:6000'
@@ -169,6 +177,7 @@ class BackendServicer(backend_pb2_grpc.BackendServicer):
         url = 'http://localhost:6000/generate'
         data = {
             "prompt": request.positive_prompt,
+            "negative_prompt": request.negative_prompt,
             "num_inference_steps": request.step,
             "seed": request.seed,
             "cfg": self.last_cfg_scale
@@ -181,7 +190,6 @@ class BackendServicer(backend_pb2_grpc.BackendServicer):
         if output_base64:
             output_bytes = base64.b64decode(output_base64)
             output = pickle.loads(output_bytes)
-            logger.info("Output object deserialized successfully")
         else:
             output = None
             kill_process()

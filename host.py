@@ -10,17 +10,11 @@ import io
 import logging
 import base64
 import torch.multiprocessing as mp
+from compel import Compel, ReturnedEmbeddingsType
 
 from PIL import Image
 from flask import Flask, request, jsonify
-from diffusers.schedulers import (
-    # DDIM
-    DDIMScheduler,
-    # DPM
-    DPMSolverMultistepScheduler,
-    # Euler
-    EulerDiscreteScheduler,
-)
+from diffusers.schedulers import (DDIMScheduler, DPMSolverMultistepScheduler, EulerDiscreteScheduler)
 from distrifuser.utils import DistriConfig
 from distrifuser.pipelines import DistriSDPipeline, DistriSDXLPipeline
 
@@ -41,16 +35,16 @@ initialized = False
 
 def get_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    #parser.add_argument(
-    #    "--mode",
-    #    type=str,
-    #    default="generation",
-    #    choices=["generation", "benchmark"],
-    #    help="Purpose of running the script",
-    #)
+    # parser.add_argument(
+    #     "--mode",
+    #     type=str,
+    #     default="generation",
+    #     choices=["generation", "benchmark"],
+    #     help="Purpose of running the script",
+    # )
 
     # Diffuser specific arguments
-    #parser.add_argument("--output_path", type=str, default=None)
+    # parser.add_argument("--output_path", type=str, default=None)
     parser.add_argument("--num_inference_steps", type=int, default=50, help="Number of inference steps")
     parser.add_argument("--guidance_scale", type=float, default=5.0)
     parser.add_argument("--scheduler", type=str, default="dpm-solver", choices=["euler", "dpm-solver", "ddim"])
@@ -85,21 +79,21 @@ def get_args() -> argparse.Namespace:
     )
 
     # Benchmark specific arguments
-    #parser.add_argument("--output_type", type=str, default="pil", choices=["latent", "pil"])
-    #parser.add_argument("--warmup_times", type=int, default=5, help="Number of warmup times")
-    #parser.add_argument("--test_times", type=int, default=20, help="Number of test times")
-    #parser.add_argument(
-    #    "--ignore_ratio", type=float, default=0.2, help="Ignored ratio of the slowest and fastest steps"
-    #)
+    # parser.add_argument("--output_type", type=str, default="pil", choices=["latent", "pil"])
+    # parser.add_argument("--warmup_times", type=int, default=5, help="Number of warmup times")
+    # parser.add_argument("--test_times", type=int, default=20, help="Number of test times")
+    # parser.add_argument(
+    #     "--ignore_ratio", type=float, default=0.2, help="Ignored ratio of the slowest and fastest steps"
+    # )
 
     # Added arguments
-    #parser.add_argument("--positive_prompt", type=str, default="Astronaut in a jungle, cold color palette, muted colors, detailed, 8k")
-    #parser.add_argument("--negative_prompt", type=str, default=None)
     parser.add_argument("--model_path", type=str, default=None, help="Path to model folder")
     parser.add_argument("--height", type=int, default=512, help="Image height")
     parser.add_argument("--width", type=int, default=512, help="Image width")
     parser.add_argument("--variant", type=str, default="fp16", help="PyTorch variant [fp16/fp32]")
     parser.add_argument("--pipeline_type", type=str, default="SDXL", help="Stable Diffusion pipeline type [SD/SDXL]")
+    parser.add_argument("--compel", action="store_true", help="Enable Compel")
+    # parser.add_argument("--lora", type=str, default=None, help="A JSON of LoRAs to load, with their weights")
     args = parser.parse_args()
     return args
 
@@ -184,6 +178,21 @@ def initialize():
 
     pipe.set_progress_bar_config(disable=distri_config.rank != 0)
     logger.info("Model initialization completed")
+
+    # if args.lora:
+    #     loras = json.loads(args.lora)
+    #     i = 0
+    #     adapters_name = []
+    #     adapters_weights = []
+    #     for adapter, weight in loras.items():
+    #         pipe.pipeline.load_lora_weights(adapter, adapter_name=f"adapter_{i}")
+    #         adapters_name.append(f"adapter_{i}")
+    #         i += 1
+    #         logger.info(f"Loaded LoRA: {adapter}")
+    #         adapters_weights.append(weight)
+    #         logger.info(f"Set LoRA weight: {weight}")
+    #     pipe.pipeline.set_adapters(adapters_name, adapter_weights=adapters_weights)
+
     initialized = True  # 设置初始化完成标志
     return
 
@@ -196,12 +205,31 @@ def generate_image_parallel(
     logger.info(f"Negative: {negative_prompt}")
     torch.cuda.reset_peak_memory_stats()
     start_time = time.time()
+    args = get_args()
+    positive_prompt_embeds = None
+    positive_pooled_prompt_embeds = None
+    negative_prompt_embeds = None
+    negative_pooled_prompt_embeds = None
+    if args.compel:
+        compel = Compel(
+            tokenizer=[pipe.pipeline.tokenizer, pipe.pipeline.tokenizer_2],
+            text_encoder=[pipe.pipeline.text_encoder, pipe.pipeline.text_encoder_2],
+            returned_embeddings_type=ReturnedEmbeddingsType.PENULTIMATE_HIDDEN_STATES_NON_NORMALIZED,
+            requires_pooled=[False, True]
+        )
+        positive_prompt_embeds, positive_pooled_prompt_embeds = compel([positive_prompt])
+        if len(negative_prompt) > 0:
+            negative_prompt_embeds, negative_pooled_prompt_embeds = compel([negative_prompt])
     output = pipe(
-        prompt=positive_prompt,
-        negative_prompt=negative_prompt,
+        prompt=positive_prompt if positive_prompt_embeds is None else None,
+        negative_prompt=negative_prompt if negative_prompt_embeds is None else None,
         generator=torch.Generator(device="cuda").manual_seed(seed),
         num_inference_steps=num_inference_steps,
         guidance_scale=cfg,
+        prompt_embeds=positive_prompt_embeds,
+        pooled_prompt_embeds=positive_pooled_prompt_embeds,
+        negative_prompt_embeds=negative_prompt_embeds,
+        negative_pooled_prompt_embeds=negative_pooled_prompt_embeds,
     )
     end_time = time.time()
     elapsed_time = end_time - start_time
