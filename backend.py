@@ -33,6 +33,8 @@ def kill_process():
     global process
     if process is not None:
         process.terminate()
+        time.sleep(15)
+        process = None
 
 
 # Implement the BackendServicer class with the service methods
@@ -77,13 +79,9 @@ class BackendServicer(backend_pb2_grpc.BackendServicer):
             self.needs_reload = True
             self.variant = "fp32"
 
-        if request.SchedulerType != "" and request.SchedulerType != self.last_scheduler:
-            if request.SchedulerType in ["euler", "dpmpp_2m", "ddim"]:
-                self.needs_reload = True
-                self.last_scheduler = request.SchedulerType
-            else:
-                kill_process()
-                assert False, "Unsupported scheduler type"
+        if request.SchedulerType != self.last_scheduler:
+            self.needs_reload = True
+            self.last_scheduler = request.SchedulerType
 
         # if request.LoraAdapters:
         #     if len(self.last_lora_adapters) == 0 and len(request.LoraAdapters) == 0:
@@ -163,16 +161,16 @@ class BackendServicer(backend_pb2_grpc.BackendServicer):
                 try:
                     response = requests.get(initialize_url)
                     if response.status_code == 200 and response.json().get("status") == "initialized":
+                        self.is_loaded = True
+                        self.needs_reload = False
                         break
                 except requests.exceptions.RequestException:
                     pass
                 time.sleep(1)
                 time_elapsed += 1
-                if time_elapsed > 60:
+                if time_elapsed > 120:
                     kill_process()
-                    return backend_pb2.Result(message="Failed to launch host within 60 seconds", success=False)
-            self.is_loaded = True
-            self.needs_reload = False
+                    return backend_pb2.Result(message="Failed to launch host within 120 seconds", success=False)
 
         if self.is_loaded:
             url = 'http://localhost:6000/generate'

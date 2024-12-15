@@ -10,13 +10,26 @@ import io
 import logging
 import base64
 import torch.multiprocessing as mp
-from compel import Compel, ReturnedEmbeddingsType
 
+from compel import Compel, ReturnedEmbeddingsType
 from PIL import Image
 from flask import Flask, request, jsonify
-from diffusers.schedulers import DDIMScheduler, DPMSolverMultistepScheduler, EulerDiscreteScheduler
 from distrifuser.utils import DistriConfig
 from distrifuser.pipelines import DistriSDPipeline, DistriSDXLPipeline
+
+from diffusers.schedulers import (
+    DDIMScheduler,
+    DPMSolverMultistepScheduler,
+    DPMSolverSinglestepScheduler,
+    EulerAncestralDiscreteScheduler,
+    EulerDiscreteScheduler,
+    HeunDiscreteScheduler,
+    LMSDiscreteScheduler,
+    KDPM2AncestralDiscreteScheduler,
+    KDPM2DiscreteScheduler,
+    PNDMScheduler,
+    UniPCMultistepScheduler,
+)
 
 app = Flask(__name__)
 
@@ -33,6 +46,45 @@ logger = None
 initialized = False
 
 
+def get_scheduler(scheduler_name, current_scheduler_config):
+    scheduler_class = get_scheduler_class(scheduler_name)
+    scheduler_config = get_scheduler_config(scheduler_name, current_scheduler_config)
+    return scheduler_class.from_config(scheduler_config)
+
+
+def get_scheduler_class(scheduler_name):
+    if scheduler_name.startswith("k_"):
+        scheduler_name.replace("k_", "", 1)
+
+    match scheduler_name:
+        case "ddim": return DDIMScheduler
+        case "euler": return EulerDiscreteScheduler
+        case "euler_a": return EulerAncestralDiscreteScheduler
+        case "dpm_2": return KDPM2DiscreteScheduler
+        case "dpm_2_a": return KDPM2AncestralDiscreteScheduler
+        case "dpmpp_2m": return DPMSolverMultistepScheduler
+        case "dpmpp_2m_sde": return DPMSolverMultistepScheduler
+        case "dpmpp_sde": return DPMSolverSinglestepScheduler
+        case "heun": return HeunDiscreteScheduler
+        case "lms": return LMSDiscreteScheduler
+        case "pndm": return PNDMScheduler
+        case "unipc": return UniPCMultistepScheduler
+        case _:
+            raise NotImplementedError
+
+
+def get_scheduler_config(scheduler_name, current_scheduler_config):
+    if scheduler_name.startswith("k_"):
+        current_scheduler_config["use_karras_sigmas"] = True
+    match scheduler_name:
+        case "dpmpp_2m":
+            current_scheduler_config["algorithm_type"] = "dpmsolver++"
+            current_scheduler_config["solver_order"] = 2
+        case "dpmpp_2m_sde":
+            current_scheduler_config["algorithm_type"] = "sde-dpmsolver++"
+    return current_scheduler_config
+
+
 def get_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     # parser.add_argument(
@@ -47,7 +99,7 @@ def get_args() -> argparse.Namespace:
     # parser.add_argument("--output_path", type=str, default=None)
     parser.add_argument("--num_inference_steps", type=int, default=50, help="Number of inference steps")
     parser.add_argument("--guidance_scale", type=float, default=5.0)
-    parser.add_argument("--scheduler", type=str, default="dpmpp_2m", choices=["euler", "dpmpp_2m", "ddim"])
+    parser.add_argument("--scheduler", type=str, default="dpmpp_2m", help="Scheduler name")
     parser.add_argument("--seed", type=int, default=1234, help="Random seed")
 
     # DistriFuser specific arguments
@@ -143,14 +195,6 @@ def initialize():
     )
 
     assert args.model_path is not None, "No model specified"
-    if args.scheduler == "euler":
-        scheduler = EulerDiscreteScheduler.from_pretrained(args.model_path, subfolder="scheduler")
-    elif args.scheduler == "dpmpp_2m":
-        scheduler = DPMSolverMultistepScheduler.from_pretrained(args.model_path, subfolder="scheduler")
-    elif args.scheduler == "ddim":
-        scheduler = DDIMScheduler.from_pretrained(args.model_path, subfolder="scheduler")
-    else:
-        raise NotImplementedError
 
     assert args.variant in ["fp16", "fp32"], "Unsupported variant"
 
@@ -165,10 +209,16 @@ def initialize():
         distri_config=distri_config,
         torch_dtype=torch.float16 if args.variant == "fp16" else torch.float32,
         use_safetensors=True,
-        scheduler=scheduler,
     )
 
+    pipe.pipeline.scheduler = get_scheduler(args.scheduler, pipe.pipeline.scheduler.config)
+
     pipe.set_progress_bar_config(disable=distri_config.rank != 0)
+    pipe.pipeline.enable_vae_slicing()
+    pipe.pipeline.enable_vae_tiling()
+    #pipe.pipeline.enable_xformers_memory_efficient_attention()
+    #pipe.pipeline.enable_sequential_cpu_offload()
+    #pipe.pipeline.enable_model_cpu_offload()
     logger.info("Model initialization completed")
 
     # if args.lora:
