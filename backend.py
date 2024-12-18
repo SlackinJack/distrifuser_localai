@@ -20,7 +20,8 @@ from PIL import Image
 
 _ONE_DAY_IN_SECONDS = 60 * 60 * 24
 COMPEL = os.environ.get("COMPEL", "0") == "1"
-WARMUP_STEPS = 1
+WARMUP_STEPS = 0
+HOST_INIT_TIMEOUT = 90
 
 
 # If MAX_WORKERS are specified in the environment use it, otherwise default to 1
@@ -46,12 +47,13 @@ class BackendServicer(backend_pb2_grpc.BackendServicer):
     last_cfg_scale = 7
     last_scheduler = None
     variant = "fp32"
-    is_loaded = False
-    needs_reload = False
-    last_clip_skip = 0
-    is_low_vram = False
     # last_lora_adapters = []
     # loras = {}
+    last_clip_skip = 0
+    is_low_vram = False
+
+    is_loaded = False
+    needs_reload = False
 
 
     def Health(self, request, context):
@@ -151,6 +153,7 @@ class BackendServicer(backend_pb2_grpc.BackendServicer):
                 'torchrun',
                 f'--nproc_per_node={nproc_per_node}',
                 'host.py',
+
                 f'--model_path={self.last_model_path}',
                 f'--pipeline_type={pipeline_type}',
                 f'--variant={self.variant}',
@@ -178,8 +181,7 @@ class BackendServicer(backend_pb2_grpc.BackendServicer):
             cmd = [arg for arg in cmd if arg]
             global process
             process = subprocess.Popen(cmd)
-            host = 'http://localhost:6000'
-            initialize_url = f"{host}/initialize"
+            initialize_url = "http://localhost:6000/initialize"
             time_elapsed = 0
             while True:
                 try:
@@ -192,25 +194,27 @@ class BackendServicer(backend_pb2_grpc.BackendServicer):
                     pass
                 time.sleep(1)
                 time_elapsed += 1
-                if time_elapsed > 120:
+                if time_elapsed > HOST_INIT_TIMEOUT:
                     kill_process()
-                    return backend_pb2.Result(message="Failed to launch host within 120 seconds", success=False)
+                    return backend_pb2.Result(message=f"Failed to launch host within {HOST_INIT_TIMEOUT} seconds", success=False)
 
         if self.is_loaded:
             url = 'http://localhost:6000/generate'
             data = {
-                "prompt": request.positive_prompt,
-                "negative_prompt": request.negative_prompt,
+                "positive_prompt": request.positive_prompt,
                 "num_inference_steps": request.step,
                 "seed": request.seed,
                 "cfg": self.last_cfg_scale,
                 "clip_skip": self.last_clip_skip,
             }
+
             if request.negative_prompt and len(request.negative_prompt) > 0:
                 data["negative_prompt"] = request.negative_prompt
+
             response = requests.post(url, json=data)
             response_data = response.json()
             output_base64 = response_data.get("output", "")
+
             if output_base64:
                 output_bytes = base64.b64decode(output_base64)
                 output = pickle.loads(output_bytes)
@@ -256,9 +260,6 @@ def serve(address):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run the gRPC server.")
-    parser.add_argument(
-        "--addr", default="localhost:50051", help="The address to bind the server to."
-    )
+    parser.add_argument("--addr", default="localhost:50051", help="The address to bind the server to.")
     args = parser.parse_args()
-
     serve(args.addr)

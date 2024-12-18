@@ -182,11 +182,7 @@ def initialize():
     assert args.variant in ["fp16", "fp32"], "Unsupported variant"
 
     assert args.pipeline_type in ["SD", "SDXL"], "Unsupported pipeline"
-    if args.pipeline_type == "SDXL":
-        PipelineClass = DistriSDXLPipeline
-    else:
-        PipelineClass = DistriSDPipeline
-
+    PipelineClass = DistriSDXLPipeline if args.pipeline_type == "SDXL" else DistriSDPipeline
     pipe = PipelineClass.from_pretrained(
         pretrained_model_name_or_path=args.model_path,
         distri_config=distri_config,
@@ -223,7 +219,7 @@ def initialize():
     #     pipe.pipeline.set_adapters(adapters_name, adapter_weights=adapters_weights)
 
     logger.info("Model initialization completed")
-    initialized = True  # 设置初始化完成标志
+    initialized = True
     return
 
 
@@ -249,7 +245,7 @@ def generate_image_parallel(
             requires_pooled=[False, True]
         )
         positive_embeds, positive_pooled_embeds = compel([positive_prompt])
-        if len(negative_prompt) > 0:
+        if negative_prompt and len(negative_prompt) > 0:
             negative_embeds, negative_pooled_embeds = compel([negative_prompt])
     
     output = pipe(
@@ -294,18 +290,24 @@ def generate_image_parallel(
 def generate_image():
     logger.info("Received POST request for image generation")
     data = request.json
-    prompt = data.get("prompt")
-    negative_prompt = data.get("negative_prompt")
-    num_inference_steps = data.get("num_inference_steps")
-    seed = data.get("seed")
-    cfg = data.get("cfg", 8.0)
-    clip_skip = data.get("clip_skip", 0)
+    positive_prompt     = data.get("positive_prompt", None)
+    negative_prompt     = data.get("negative_prompt", None)
+    num_inference_steps = data.get("num_inference_steps", 30)
+    seed                = data.get("seed", 1)
+    cfg                 = data.get("cfg", 3.5)
+    clip_skip           = data.get("clip_skip", 0)
 
     logger.info(
-        f"Request parameters: prompt='{prompt}', negative_prompt='{negative_prompt}', steps={num_inference_steps}, seed={seed}, cfg={cfg}, clip_skip={clip_skip}"
+        "Request parameters:\n"
+        f"positive_prompt='{positive_prompt}'\n"
+        f"negative_prompt='{negative_prompt}'\n"
+        f"steps={num_inference_steps}\n"
+        f"seed={seed}\n"
+        f"cfg={cfg}\n"
+        f"clip_skip={clip_skip}"
     )
     # Broadcast request parameters to all processes
-    params = [prompt, negative_prompt, num_inference_steps, seed, cfg, clip_skip]
+    params = [positive_prompt, negative_prompt, num_inference_steps, seed, cfg, clip_skip]
     dist.broadcast_object_list(params, src=0)
     logger.info("Parameters broadcasted to all processes")
 
