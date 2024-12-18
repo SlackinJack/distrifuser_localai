@@ -20,6 +20,7 @@ from PIL import Image
 
 _ONE_DAY_IN_SECONDS = 60 * 60 * 24
 COMPEL = os.environ.get("COMPEL", "0") == "1"
+WARMUP_STEPS = 1
 
 
 # If MAX_WORKERS are specified in the environment use it, otherwise default to 1
@@ -47,6 +48,8 @@ class BackendServicer(backend_pb2_grpc.BackendServicer):
     variant = "fp32"
     is_loaded = False
     needs_reload = False
+    last_clip_skip = 0
+    is_low_vram = False
     # last_lora_adapters = []
     # loras = {}
 
@@ -57,15 +60,16 @@ class BackendServicer(backend_pb2_grpc.BackendServicer):
 
     def LoadModel(self, request, context):
         if request.CFGScale != 0 and self.last_cfg_scale != request.CFGScale:
-            self.needs_reload = True
             self.last_cfg_scale = request.CFGScale
 
         if request.Model != self.last_model_path or (
-                request.ModelFile != "" and \
-                os.path.exists(request.ModelFile) and \
-                request.ModelFile != self.last_model_path
-            ):
-           self.needs_reload = True
+            len(request.ModelFile) > 0 and (
+                os.path.exists(request.ModelFile) and (
+                    request.ModelFile != self.last_model_path
+                )
+            )
+        ):
+            self.needs_reload = True
 
         self.last_model_path = request.Model
         if request.ModelFile != "":
@@ -102,12 +106,18 @@ class BackendServicer(backend_pb2_grpc.BackendServicer):
         #                 self.loras[adapter] = request.LoraScales[i]
         #                i += 1
 
+        if request.CLIPSkip != self.last_clip_skip:
+            self.last_clip_skip = request.CLIPSkip
+
+        if self.is_low_vram != request.LowVRAM:
+            self.needs_reload = True
+            self.is_low_vram = request.LowVRAM
+
         return backend_pb2.Result(message="", success=True)
 
 
     def GenerateImage(self, request, context):
-        if request.height != self.last_height or \
-           request.width != self.last_width:
+        if request.height != self.last_height or request.width != self.last_width:
             self.needs_reload = True
 
         if not self.is_loaded or self.needs_reload:
@@ -116,19 +126,26 @@ class BackendServicer(backend_pb2_grpc.BackendServicer):
             self.last_height = request.height
             self.last_width = request.width
 
-            # pipeline_type = "SDXL"
-            if "sdxl" in self.last_model_path.lower() or \
-               "_xl" in self.last_model_path.lower() or \
-               "-xl" in self.last_model_path.lower() or \
-               " xl" in self.last_model_path.lower() or \
-               "XL" in self.last_model_path:
+            CFG_ARGS = ""
+
+            pipeline_type = "SD"
+            sdxl_model_names_lower = ["sdxl", "_xl", "-xl", " xl"]
+            for name in sdxl_model_names_lower:
+                if name in self.last_model_path.lower():
+                    pipeline_type = "SDXL"
+                    break
+            if "XL" in self.last_model_path:
                 pipeline_type = "SDXL"
-            else:
-                pipeline_type = "SD"
 
             scheduler = self.last_scheduler
             if scheduler is None or len(scheduler) == 0:
                 scheduler = "dpmpp_2m"
+
+            # enable for more vram usage, and slower
+            # best to leave this disabled
+            no_split_batch = False
+            if no_split_batch:
+                CFG_ARGS = '--no_split_batch'
 
             cmd = [
                 'torchrun',
@@ -142,7 +159,8 @@ class BackendServicer(backend_pb2_grpc.BackendServicer):
                 f'--scheduler={scheduler}',
                 f'--guidance_scale={self.last_cfg_scale}',
                 f'--no_cuda_graph',
-                f'--no_split_batch',
+                f'--warmup_steps={WARMUP_STEPS}',
+                CFG_ARGS,
             ]
 
             if COMPEL:
@@ -150,6 +168,12 @@ class BackendServicer(backend_pb2_grpc.BackendServicer):
 
             # if len(self.loras) > 0:
             #     cmd.append(f'--lora={json.dumps(self.loras)}')
+
+            if self.is_low_vram:
+                # cmd.append('--enable_model_cpu_offload')          # breaks parallelism
+                # cmd.append('--enable_sequential_cpu_offload')     # crash
+                cmd.append('--enable_tiling')
+                cmd.append('--enable_slicing')
 
             cmd = [arg for arg in cmd if arg]
             global process
@@ -179,7 +203,8 @@ class BackendServicer(backend_pb2_grpc.BackendServicer):
                 "negative_prompt": request.negative_prompt,
                 "num_inference_steps": request.step,
                 "seed": request.seed,
-                "cfg": self.last_cfg_scale
+                "cfg": self.last_cfg_scale,
+                "clip_skip": self.last_clip_skip,
             }
             if request.negative_prompt and len(request.negative_prompt) > 0:
                 data["negative_prompt"] = request.negative_prompt
@@ -193,9 +218,12 @@ class BackendServicer(backend_pb2_grpc.BackendServicer):
                 output = None
                 kill_process()
                 assert False, "No output object received"
-            images = output.images
-            images[0].save(request.dst)
-            return backend_pb2.Result(message="Media generated", success=True)
+            image = output.images[0]
+            if image.size == (0,0) or not image.getbbox():
+                return backend_pb2.Result(message="No image generated", success=False)
+            else:
+                image.save(request.dst)
+                return backend_pb2.Result(message="Media generated", success=True)
         else:
             return backend_pb2.Result(message="Host is not loaded", success=False)
 

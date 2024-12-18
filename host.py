@@ -7,6 +7,7 @@ import torch
 import torch.distributed as dist
 import pickle
 import io
+# import json
 import logging
 import base64
 import torch.multiprocessing as mp
@@ -33,11 +34,9 @@ from diffusers.schedulers import (
 
 app = Flask(__name__)
 
-# 设置 NCCL 超时和错误处理
 os.environ["NCCL_BLOCKING_WAIT"] = "1"
 os.environ["NCCL_ASYNC_ERROR_HANDLING"] = "1"
 
-# 全局变量
 pipe = None
 engine_config = None
 input_config = None
@@ -57,20 +56,19 @@ def get_scheduler_class(scheduler_name):
         scheduler_name.replace("k_", "", 1)
 
     match scheduler_name:
-        case "ddim": return DDIMScheduler
-        case "euler": return EulerDiscreteScheduler
-        case "euler_a": return EulerAncestralDiscreteScheduler
-        case "dpm_2": return KDPM2DiscreteScheduler
-        case "dpm_2_a": return KDPM2AncestralDiscreteScheduler
-        case "dpmpp_2m": return DPMSolverMultistepScheduler
-        case "dpmpp_2m_sde": return DPMSolverMultistepScheduler
-        case "dpmpp_sde": return DPMSolverSinglestepScheduler
-        case "heun": return HeunDiscreteScheduler
-        case "lms": return LMSDiscreteScheduler
-        case "pndm": return PNDMScheduler
-        case "unipc": return UniPCMultistepScheduler
-        case _:
-            raise NotImplementedError
+        case "ddim":            return DDIMScheduler
+        case "euler":           return EulerDiscreteScheduler
+        case "euler_a":         return EulerAncestralDiscreteScheduler
+        case "dpm_2":           return KDPM2DiscreteScheduler
+        case "dpm_2_a":         return KDPM2AncestralDiscreteScheduler
+        case "dpmpp_2m":        return DPMSolverMultistepScheduler
+        case "dpmpp_2m_sde":    return DPMSolverMultistepScheduler
+        case "dpmpp_sde":       return DPMSolverSinglestepScheduler
+        case "heun":            return HeunDiscreteScheduler
+        case "lms":             return LMSDiscreteScheduler
+        case "pndm":            return PNDMScheduler
+        case "unipc":           return UniPCMultistepScheduler
+        case _:                 raise NotImplementedError
 
 
 def get_scheduler_config(scheduler_name, current_scheduler_config):
@@ -87,25 +85,15 @@ def get_scheduler_config(scheduler_name, current_scheduler_config):
 
 def get_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    # parser.add_argument(
-    #     "--mode",
-    #     type=str,
-    #     default="generation",
-    #     choices=["generation", "benchmark"],
-    #     help="Purpose of running the script",
-    # )
 
     # Diffuser specific arguments
-    # parser.add_argument("--output_path", type=str, default=None)
     parser.add_argument("--num_inference_steps", type=int, default=50, help="Number of inference steps")
     parser.add_argument("--guidance_scale", type=float, default=5.0)
     parser.add_argument("--scheduler", type=str, default="dpmpp_2m", help="Scheduler name")
     parser.add_argument("--seed", type=int, default=1234, help="Random seed")
 
     # DistriFuser specific arguments
-    parser.add_argument(
-        "--no_split_batch", action="store_true", help="Disable the batch splitting for classifier-free guidance"
-    )
+    parser.add_argument("--no_split_batch", action="store_true", help="Disable the batch splitting for classifier-free guidance")
     parser.add_argument("--warmup_steps", type=int, default=4, help="Number of warmup steps")
     parser.add_argument(
         "--sync_mode",
@@ -130,14 +118,6 @@ def get_args() -> argparse.Namespace:
         help="Split scheme for naive patch",
     )
 
-    # Benchmark specific arguments
-    # parser.add_argument("--output_type", type=str, default="pil", choices=["latent", "pil"])
-    # parser.add_argument("--warmup_times", type=int, default=5, help="Number of warmup times")
-    # parser.add_argument("--test_times", type=int, default=20, help="Number of test times")
-    # parser.add_argument(
-    #     "--ignore_ratio", type=float, default=0.2, help="Ignored ratio of the slowest and fastest steps"
-    # )
-
     # Added arguments
     parser.add_argument("--model_path", type=str, default=None, help="Path to model folder")
     parser.add_argument("--height", type=int, default=512, help="Image height")
@@ -145,7 +125,11 @@ def get_args() -> argparse.Namespace:
     parser.add_argument("--variant", type=str, default="fp16", help="PyTorch variant [fp16/fp32]")
     parser.add_argument("--pipeline_type", type=str, default="SDXL", help="Stable Diffusion pipeline type [SD/SDXL]")
     parser.add_argument("--compel", action="store_true", help="Enable Compel")
-    # parser.add_argument("--lora", type=str, default=None, help="A JSON of LoRAs to load, with their weights")
+    # parser.add_argument("--lora", type=str, default=None, help="A dictionary of LoRAs to load, with their weights")
+    parser.add_argument("--enable_model_cpu_offload", action="store_true")
+    parser.add_argument("--enable_sequential_cpu_offload", action="store_true")
+    parser.add_argument("--enable_tiling", action="store_true")
+    parser.add_argument("--enable_slicing", action="store_true")
     args = parser.parse_args()
     return args
 
@@ -180,8 +164,7 @@ def initialize():
     logger.info(f"Initializing model on GPU: {torch.cuda.current_device()}")
 
     args = get_args()
-    assert args.height > 0, "Invalid height"
-    assert args.width > 0, "Invalid width"
+    assert (args.height > 0 and args.width > 0), "Invalid image dimensions"
     distri_config = DistriConfig(
         height=args.height,
         width=args.width,
@@ -213,13 +196,17 @@ def initialize():
 
     pipe.pipeline.scheduler = get_scheduler(args.scheduler, pipe.pipeline.scheduler.config)
 
+    if args.enable_slicing:
+        pipe.pipeline.enable_vae_slicing()
+    if args.enable_tiling:
+        pipe.pipeline.enable_vae_tiling()
+    if args.enable_model_cpu_offload:
+        pipe.pipeline.enable_model_cpu_offload()
+    if args.enable_sequential_cpu_offload:
+        pipe.pipeline.enable_sequential_cpu_offload()
+    # pipe.pipeline.enable_xformers_memory_efficient_attention()
+
     pipe.set_progress_bar_config(disable=distri_config.rank != 0)
-    pipe.pipeline.enable_vae_slicing()
-    pipe.pipeline.enable_vae_tiling()
-    #pipe.pipeline.enable_xformers_memory_efficient_attention()
-    #pipe.pipeline.enable_sequential_cpu_offload()
-    #pipe.pipeline.enable_model_cpu_offload()
-    logger.info("Model initialization completed")
 
     # if args.lora:
     #     loras = json.loads(args.lora)
@@ -235,12 +222,13 @@ def initialize():
     #         logger.info(f"Set LoRA weight: {weight}")
     #     pipe.pipeline.set_adapters(adapters_name, adapter_weights=adapters_weights)
 
+    logger.info("Model initialization completed")
     initialized = True  # 设置初始化完成标志
     return
 
 
 def generate_image_parallel(
-    positive_prompt, negative_prompt, num_inference_steps, seed, cfg, save_disk_path=None
+    positive_prompt, negative_prompt, num_inference_steps, seed, cfg, clip_skip
 ):
     global pipe, local_rank, input_config
     logger.info(f"Starting image generation with prompt: {positive_prompt}")
@@ -249,10 +237,10 @@ def generate_image_parallel(
     start_time = time.time()
     args = get_args()
 
-    positive_prompt_embeds = None
-    positive_pooled_prompt_embeds = None
-    negative_prompt_embeds = None
-    negative_pooled_prompt_embeds = None
+    positive_embeds = None
+    positive_pooled_embeds = None
+    negative_embeds = None
+    negative_pooled_embeds = None
     if args.compel:
         compel = Compel(
             tokenizer=[pipe.pipeline.tokenizer, pipe.pipeline.tokenizer_2],
@@ -260,64 +248,47 @@ def generate_image_parallel(
             returned_embeddings_type=ReturnedEmbeddingsType.PENULTIMATE_HIDDEN_STATES_NON_NORMALIZED,
             requires_pooled=[False, True]
         )
-        positive_prompt_embeds, positive_pooled_prompt_embeds = compel([positive_prompt])
+        positive_embeds, positive_pooled_embeds = compel([positive_prompt])
         if len(negative_prompt) > 0:
-            negative_prompt_embeds, negative_pooled_prompt_embeds = compel([negative_prompt])
+            negative_embeds, negative_pooled_embeds = compel([negative_prompt])
     
     output = pipe(
-        prompt=positive_prompt if positive_prompt_embeds is None else None,
-        negative_prompt=negative_prompt if negative_prompt_embeds is None else None,
+        prompt=positive_prompt if positive_embeds is None else None,
+        negative_prompt=negative_prompt if negative_embeds is None else None,
         generator=torch.Generator(device="cuda").manual_seed(seed),
         num_inference_steps=num_inference_steps,
         guidance_scale=cfg,
-        prompt_embeds=positive_prompt_embeds,
-        pooled_prompt_embeds=positive_pooled_prompt_embeds,
-        negative_prompt_embeds=negative_prompt_embeds,
-        negative_pooled_prompt_embeds=negative_pooled_prompt_embeds,
+        clip_skip=clip_skip,
+        prompt_embeds=positive_embeds,
+        pooled_prompt_embeds=positive_pooled_embeds,
+        negative_embeds=negative_embeds,
+        negative_pooled_embeds=negative_pooled_embeds,
     )
     end_time = time.time()
     elapsed_time = end_time - start_time
     logger.info(f"Image generation completed in {elapsed_time:.2f} seconds")
 
-    if save_disk_path is not None:
-        timestamp = time.strftime("%Y%m%d-%H%M%S")
-        filename = f"generated_image_{timestamp}.png"
-        file_path = os.path.join(save_disk_path, filename)
-        if dist.get_rank() != 0:
-            # Create the directory if it doesn't exist
-            os.makedirs(save_disk_path, exist_ok=True)
-            # Save the image to the specified directory
-            output.images[0].save(file_path)
-            # logger.info(f"Image saved to: {file_path}")
+    if dist.get_rank() != 0:
+        # serialize output object
+        output_bytes = pickle.dumps(output)
 
-        output = file_path
-    else:
-        if dist.get_rank() != 0:
-            # serialize output object
-            output_bytes = pickle.dumps(output)
+        # send output to rank 0
+        dist.send(torch.tensor(len(output_bytes), device=f"cuda:{local_rank}"), dst=0)
+        dist.send(torch.ByteTensor(list(output_bytes)).to(f"cuda:{local_rank}"), dst=0)
 
-            # send output to rank 0
-            dist.send(
-                torch.tensor(len(output_bytes), device=f"cuda:{local_rank}"), dst=0
-            )
-            dist.send(
-                torch.ByteTensor(list(output_bytes)).to(f"cuda:{local_rank}"), dst=0
-            )
+        logger.info(f"Output sent to rank 0")
 
-            logger.info(f"Output sent to rank 0")
+    if dist.get_rank() == 0:
+        # recv from rank world_size - 1
+        size = torch.tensor(0, device=f"cuda:{local_rank}")
+        dist.recv(size, src=dist.get_world_size() - 1)
+        output_bytes = torch.ByteTensor(size.item()).to(f"cuda:{local_rank}")
+        dist.recv(output_bytes, src=dist.get_world_size() - 1)
 
-        if dist.get_rank() == 0:
-            # recv from rank world_size - 1
-            size = torch.tensor(0, device=f"cuda:{local_rank}")
-            dist.recv(size, src=dist.get_world_size() - 1)
-            output_bytes = torch.ByteTensor(size.item()).to(f"cuda:{local_rank}")
-            dist.recv(output_bytes, src=dist.get_world_size() - 1)
-
-            # deserialize output object
-            output = pickle.loads(output_bytes.cpu().numpy().tobytes())
+        # deserialize output object
+        output = pickle.loads(output_bytes.cpu().numpy().tobytes())
 
     return output, elapsed_time
-
 
 @app.route("/generate", methods=["POST"])
 def generate_image():
@@ -328,51 +299,32 @@ def generate_image():
     num_inference_steps = data.get("num_inference_steps")
     seed = data.get("seed")
     cfg = data.get("cfg", 8.0)
-    save_disk_path = data.get("save_disk_path")
-
-    # Check if save_disk_path is valid, if not, set it to a default directory
-    if save_disk_path:
-        if not os.path.isdir(save_disk_path):
-            default_path = os.path.join(os.path.expanduser("~"), "tacodit_output")
-            os.makedirs(default_path, exist_ok=True)
-            logger.warning(
-                f"Invalid save_disk_path. Using default path: {default_path}"
-            )
-            save_disk_path = default_path
-    else:
-        save_disk_path = None
+    clip_skip = data.get("clip_skip", 0)
 
     logger.info(
-        f"Request parameters: prompt='{prompt}', negative_prompt='{negative_prompt}', steps={num_inference_steps}, seed={seed}, save_disk_path={save_disk_path}"
+        f"Request parameters: prompt='{prompt}', negative_prompt='{negative_prompt}', steps={num_inference_steps}, seed={seed}, cfg={cfg}, clip_skip={clip_skip}"
     )
     # Broadcast request parameters to all processes
-    params = [prompt, negative_prompt, num_inference_steps, seed, cfg, save_disk_path]
+    params = [prompt, negative_prompt, num_inference_steps, seed, cfg, clip_skip]
     dist.broadcast_object_list(params, src=0)
     logger.info("Parameters broadcasted to all processes")
 
     output, elapsed_time = generate_image_parallel(*params)
 
-    if save_disk_path:
-        # output is a disk path
-        output_base64 = ""
-        image_path = save_disk_path
+    # Ensure output is not None before accessing its attributes
+    if output and hasattr(output, "images") and output.images:
+        pickled_image = pickle.dumps(output)
+        output_base64 = base64.b64encode(pickled_image).decode('utf-8')
     else:
-        # Ensure output is not None before accessing its attributes
-        if output and hasattr(output, "images") and output.images:
-            pickled_image = pickle.dumps(output)
-            output_base64 = base64.b64encode(pickled_image).decode('utf-8')
-        else:
-            output_base64 = ""
-        image_path = ""
+        output_base64 = ""
+    image_path = ""
 
     response = {
         "message": "Image generated successfully",
         "elapsed_time": f"{elapsed_time:.2f} sec",
-        "output": output_base64 if not save_disk_path else output,
-        "save_to_disk": save_disk_path is not None,
+        "output": output_base64,
     }
 
-    #logger.info(f"Sending response: {response}")
     logger.info("Sending response")
     return jsonify(response)
 
@@ -383,8 +335,7 @@ def run_host():
         app.run(host="0.0.0.0", port=6000)
     else:
         while True:
-            # 非主进程等待广播的参数
-            params = [None] * 5
+            params = [None] * 6 # len(params) of generate_image_parallel()
             logger.info(f"Rank {dist.get_rank()} waiting for tasks")
             dist.broadcast_object_list(params, src=0)
             if params[0] is None:
