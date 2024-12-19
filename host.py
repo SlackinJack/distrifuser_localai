@@ -7,10 +7,11 @@ import torch
 import torch.distributed as dist
 import pickle
 import io
-# import json
+import json
 import logging
 import base64
 import torch.multiprocessing as mp
+import safetensors
 
 from compel import Compel, ReturnedEmbeddingsType
 from PIL import Image
@@ -125,7 +126,7 @@ def get_args() -> argparse.Namespace:
     parser.add_argument("--variant", type=str, default="fp16", help="PyTorch variant [fp16/fp32]")
     parser.add_argument("--pipeline_type", type=str, default="SDXL", help="Stable Diffusion pipeline type [SD/SDXL]")
     parser.add_argument("--compel", action="store_true", help="Enable Compel")
-    # parser.add_argument("--lora", type=str, default=None, help="A dictionary of LoRAs to load, with their weights")
+    parser.add_argument("--lora", type=str, default=None, help="A dictionary of LoRAs to load, with their weights")
     parser.add_argument("--enable_model_cpu_offload", action="store_true")
     parser.add_argument("--enable_sequential_cpu_offload", action="store_true")
     parser.add_argument("--enable_tiling", action="store_true")
@@ -152,6 +153,34 @@ def check_initialize():
         return jsonify({"status": "initialized"}), 200
     else:
         return jsonify({"status": "initializing"}), 202
+
+
+# https://github.com/haofanwang/Lora-for-Diffusers/blob/18adfa4da0afec46679eb567d5a3690fd6a4ce9c/format_convert.py
+def convert_name_to_bin(name):
+    new_name = name.replace('lora_unet' + '_', '')
+    new_name = new_name.replace('.weight', '')
+    parts = new_name.split('.')
+
+    #parts[0] = parts[0].replace('_0', '')
+    if 'out' in parts[0]:
+        parts[0] = "_".join(parts[0].split('_')[:-1])
+
+    parts[1] = parts[1].replace('_', '.')
+    sub_parts = parts[0].split('_')
+
+    new_sub_parts = ""
+    for i in range(len(sub_parts)):
+        if sub_parts[i] in ['block', 'blocks', 'attentions'] or sub_parts[i].isnumeric() or 'attn' in sub_parts[i]:
+            if 'attn' in sub_parts[i]:
+                new_sub_parts += sub_parts[i] + ".processor."
+            else:
+                new_sub_parts += sub_parts[i] + "."
+        else:
+            new_sub_parts += sub_parts[i] + "_"
+
+    new_sub_parts += parts[1]
+    new_name =  new_sub_parts + '.weight'
+    return new_name
 
 
 def initialize():
@@ -204,19 +233,36 @@ def initialize():
 
     pipe.set_progress_bar_config(disable=distri_config.rank != 0)
 
-    # if args.lora:
-    #     loras = json.loads(args.lora)
-    #     i = 0
-    #     adapters_name = []
-    #     adapters_weights = []
-    #     for adapter, weight in loras.items():
-    #         pipe.pipeline.load_lora_weights(adapter, adapter_name=f"adapter_{i}")
-    #         adapters_name.append(f"adapter_{i}")
-    #         i += 1
-    #         logger.info(f"Loaded LoRA: {adapter}")
-    #         adapters_weights.append(weight)
-    #         logger.info(f"Set LoRA weight: {weight}")
-    #     pipe.pipeline.set_adapters(adapters_name, adapter_weights=adapters_weights)
+    # there seems to be a bug preventing multiple-loras from loading separately (in the pipeline)
+    # so here we merge all the weights, then load it all at once
+    # https://github.com/huggingface/diffusers/issues/2189#issuecomment-1421350041
+    if args.lora:
+        pipe.pipeline.unet.model.enable_lora()
+        loras = json.loads(args.lora)
+        merged_weights = {}
+        i = 0
+
+        def merge_weight(key, weight, scale):
+            nonlocal loras, merged_weights
+            scaled_weight = weight * scale / len(loras)
+            existing_weight = merged_weights[key] if merged_weights.get(key) is not None else 0
+            merged_weights[key] = scaled_weight + existing_weight
+
+        for adapter, scale in loras.items():
+            if adapter.endswith(".safetensors"):
+                safe_dict = safetensors.torch.load_file(adapter, device=f'cuda:{local_rank}')
+                for k in safe_dict:
+                    if ('text' in k) or ('unet' not in k) or ('transformer_blocks' not in k) or ('ff_net' in k) or ('alpha' in k):
+                        continue
+                    merge_weight(convert_name_to_bin(k), safe_dict[k], scale)
+            else:
+                f = torch.load(adapter, weights_only=True, map_location=torch.device(f"cuda:{local_rank}"))
+                for k in f.keys():
+                    merge_weight(k, f[k], scale)
+            logger.info(f"Added LoRA[{i}], scale={scale}: {adapter}")
+            i += 1
+        pipe.pipeline.unet.model.load_attn_procs(merged_weights)
+        logger.info(f'Total loaded LoRAs: {i}')
 
     logger.info("Model initialization completed")
     initialized = True

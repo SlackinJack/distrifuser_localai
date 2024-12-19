@@ -4,7 +4,7 @@ import backend_pb2
 import backend_pb2_grpc
 import base64
 import grpc
-# import json
+import json
 import os
 import pickle
 import requests
@@ -47,8 +47,8 @@ class BackendServicer(backend_pb2_grpc.BackendServicer):
     last_cfg_scale = 7
     last_scheduler = None
     variant = "fp32"
-    # last_lora_adapters = []
-    # loras = {}
+    last_lora_adapters = []
+    loras = {}
     last_clip_skip = 0
     is_low_vram = False
 
@@ -89,24 +89,24 @@ class BackendServicer(backend_pb2_grpc.BackendServicer):
             self.needs_reload = True
             self.last_scheduler = request.SchedulerType
 
-        # if request.LoraAdapters:
-        #     if len(self.last_lora_adapters) == 0 and len(request.LoraAdapters) == 0:
-        #         pass
-        #     elif len(self.last_lora_adapters) != len(request.LoraAdapters):
-        #         self.needs_reload = True
-        #     else:
-        #         for adapter in self.last_lora_adapters:
-        #             if adapter not in request.LoraAdapters:
-        #                 self.needs_reload = True
-        #                 break
-        #     if self.needs_reload:
-        #         self.loras = {}
-        #         self.last_lora_adapters = request.LoraAdapters
-        #         if len(request.LoraAdapters) > 0:
-        #             i = 0
-        #             for adapter in request.LoraAdapters:
-        #                 self.loras[adapter] = request.LoraScales[i]
-        #                i += 1
+        if request.LoraAdapters:
+            if len(self.last_lora_adapters) == 0 and len(request.LoraAdapters) == 0:
+                pass
+            elif len(self.last_lora_adapters) != len(request.LoraAdapters):
+                self.needs_reload = True
+            else:
+                for adapter in self.last_lora_adapters:
+                    if adapter not in request.LoraAdapters:
+                        self.needs_reload = True
+                        break
+            if self.needs_reload:
+                self.loras = {}
+                self.last_lora_adapters = request.LoraAdapters
+                if len(request.LoraAdapters) > 0:
+                    i = 0
+                    for adapter in request.LoraAdapters:
+                        self.loras[adapter] = request.LoraScales[i]
+                        i += 1
 
         if request.CLIPSkip != self.last_clip_skip:
             self.last_clip_skip = request.CLIPSkip
@@ -163,14 +163,15 @@ class BackendServicer(backend_pb2_grpc.BackendServicer):
                 f'--guidance_scale={self.last_cfg_scale}',
                 f'--no_cuda_graph',
                 f'--warmup_steps={WARMUP_STEPS}',
+                '--parallelism=patch',
                 CFG_ARGS,
             ]
 
             if COMPEL:
                 cmd.append('--compel')
 
-            # if len(self.loras) > 0:
-            #     cmd.append(f'--lora={json.dumps(self.loras)}')
+            if len(self.loras) > 0:
+                cmd.append(f'--lora={json.dumps(self.loras)}')
 
             if self.is_low_vram:
                 # cmd.append('--enable_model_cpu_offload')          # breaks parallelism
