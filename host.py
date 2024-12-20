@@ -12,6 +12,7 @@ import logging
 import base64
 import torch.multiprocessing as mp
 import safetensors
+import torch.nn.functional as F
 
 from compel import Compel, ReturnedEmbeddingsType
 from PIL import Image
@@ -235,7 +236,6 @@ def initialize():
 
     # there seems to be a bug preventing multiple-loras from loading separately (in the pipeline)
     # so here we merge all the weights, then load it all at once
-    # https://github.com/huggingface/diffusers/issues/2189#issuecomment-1421350041
     if args.lora:
         pipe.pipeline.unet.model.enable_lora()
         loras = json.loads(args.lora)
@@ -244,9 +244,28 @@ def initialize():
 
         def merge_weight(key, weight, scale):
             nonlocal loras, merged_weights
-            scaled_weight = weight * scale / len(loras)
-            existing_weight = merged_weights[key] if merged_weights.get(key) is not None else 0
-            merged_weights[key] = scaled_weight + existing_weight
+            scaled_weight = torch.mul(weight, (scale / len(loras)))
+            existing_weight = merged_weights.get(key)
+            if existing_weight is None:
+                merged_weights[key] = scaled_weight
+            else:
+                ex = list(existing_weight.size())
+                sc = list(scaled_weight.size())
+                x1, y1 = ex[0], ex[1]
+                x2, y2 = sc[0], sc[1]
+                if x2 > x1 or y2 > y1:
+                    new_existing_weight = torch.zeros((x2, y2), device=f'cuda:{local_rank}')
+                    new_existing_weight[:x1, :y1] = existing_weight
+                    del existing_weight
+                    torch.cuda.empty_cache()
+                    existing_weight = new_existing_weight
+                elif x1 > x2 or y1 > y2:
+                    new_scaled_weight = torch.zeros((x1, y1), device=f'cuda:{local_rank}')
+                    new_scaled_weight[:x2, :y2] = scaled_weight
+                    del scaled_weight
+                    torch.cuda.empty_cache()
+                    scaled_weight = new_scaled_weight
+                merged_weights[key] = torch.add(scaled_weight, existing_weight)
 
         for adapter, scale in loras.items():
             if adapter.endswith(".safetensors"):
