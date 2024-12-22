@@ -17,8 +17,8 @@ import torch.nn.functional as F
 from compel import Compel, ReturnedEmbeddingsType
 from PIL import Image
 from flask import Flask, request, jsonify
-from distrifuser.utils import DistriConfig
-from distrifuser.pipelines import DistriSDPipeline, DistriSDXLPipeline
+from DistriFuser.distrifuser.utils import DistriConfig
+from DistriFuser.distrifuser.pipelines import DistriSDPipeline, DistriSDXLPipeline
 
 from diffusers.schedulers import (
     DDIMScheduler,
