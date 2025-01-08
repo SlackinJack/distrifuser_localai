@@ -307,7 +307,8 @@ def generate_image_parallel(
             tokenizer=[pipe.pipeline.tokenizer, pipe.pipeline.tokenizer_2],
             text_encoder=[pipe.pipeline.text_encoder, pipe.pipeline.text_encoder_2],
             returned_embeddings_type=ReturnedEmbeddingsType.PENULTIMATE_HIDDEN_STATES_NON_NORMALIZED,
-            requires_pooled=[False, True]
+            requires_pooled=[False, True],
+            truncate_long_prompts=False
         )
         positive_embeds, positive_pooled_embeds = compel([positive_prompt])
         if negative_prompt and len(negative_prompt) > 0:
@@ -339,7 +340,7 @@ def generate_image_parallel(
 
         logger.info(f"Output sent to rank 0")
 
-    if dist.get_rank() == 0:
+    elif dist.get_rank() == 0 and dist.get_world_size() > 1:
         # recv from rank world_size - 1
         size = torch.tensor(0, device=f"cuda:{local_rank}")
         dist.recv(size, src=dist.get_world_size() - 1)
