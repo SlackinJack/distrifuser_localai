@@ -12,7 +12,6 @@ import logging
 import base64
 import torch.multiprocessing as mp
 import safetensors
-import torch.nn.functional as F
 
 from compel import Compel, ReturnedEmbeddingsType
 from PIL import Image
@@ -124,7 +123,7 @@ def get_args() -> argparse.Namespace:
     parser.add_argument("--model_path", type=str, default=None, help="Path to model folder")
     parser.add_argument("--height", type=int, default=512, help="Image height")
     parser.add_argument("--width", type=int, default=512, help="Image width")
-    parser.add_argument("--variant", type=str, default="fp16", help="PyTorch variant [fp16/fp32]")
+    parser.add_argument("--variant", type=str, default="fp16", help="PyTorch variant [bf16/fp16/fp32]")
     parser.add_argument("--pipeline_type", type=str, default="SDXL", help="Stable Diffusion pipeline type [SD/SDXL]")
     parser.add_argument("--compel", action="store_true", help="Enable Compel")
     parser.add_argument("--lora", type=str, default=None, help="A dictionary of LoRAs to load, with their weights")
@@ -209,14 +208,21 @@ def initialize():
 
     assert args.model_path is not None, "No model specified"
 
-    assert args.variant in ["fp16", "fp32"], "Unsupported variant"
+    assert args.variant in ["bf16", "fp16", "fp32"], "Unsupported variant"
+    match args.variant:
+        case "bf16":
+            torch_dtype = torch.bfloat16
+        case "fp16":
+            torch_dtype = torch.float16
+        case _:
+            torch_dtype = torch.float32
 
     assert args.pipeline_type in ["SD", "SDXL"], "Unsupported pipeline"
     PipelineClass = DistriSDXLPipeline if args.pipeline_type == "SDXL" else DistriSDPipeline
     pipe = PipelineClass.from_pretrained(
         pretrained_model_name_or_path=args.model_path,
         distri_config=distri_config,
-        torch_dtype=torch.float16 if args.variant == "fp16" else torch.float32,
+        torch_dtype=torch_dtype,
         use_safetensors=True,
     )
 
