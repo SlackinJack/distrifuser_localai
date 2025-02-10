@@ -22,6 +22,9 @@ _ONE_DAY_IN_SECONDS = 60 * 60 * 24
 COMPEL = os.environ.get("COMPEL", "0") == "1"
 WARMUP_STEPS = 0
 HOST_INIT_TIMEOUT = 90
+PORT = "6000"
+MASTER_PORT = "29400"
+URL = f"http://localhost:{PORT}"
 
 
 # If MAX_WORKERS are specified in the environment use it, otherwise default to 1
@@ -47,7 +50,6 @@ class BackendServicer(backend_pb2_grpc.BackendServicer):
     last_cfg_scale = 7
     last_scheduler = None
     variant = "fp32"
-    last_lora_adapters = []
     loras = {}
     last_clip_skip = 0
     is_low_vram = False
@@ -65,11 +67,7 @@ class BackendServicer(backend_pb2_grpc.BackendServicer):
             self.last_cfg_scale = request.CFGScale
 
         if request.Model != self.last_model_path or (
-            len(request.ModelFile) > 0 and (
-                os.path.exists(request.ModelFile) and (
-                    request.ModelFile != self.last_model_path
-                )
-            )
+            len(request.ModelFile) > 0 and os.path.exists(request.ModelFile) and request.ModelFile != self.last_model_path
         ):
             self.needs_reload = True
 
@@ -90,18 +88,17 @@ class BackendServicer(backend_pb2_grpc.BackendServicer):
             self.last_scheduler = request.SchedulerType
 
         if request.LoraAdapters:
-            if len(self.last_lora_adapters) == 0 and len(request.LoraAdapters) == 0:
+            if len(self.loras.keys()) == 0 and len(request.LoraAdapters) == 0:
                 pass
-            elif len(self.last_lora_adapters) != len(request.LoraAdapters):
+            elif len(self.loras.keys()) != len(request.LoraAdapters):
                 self.needs_reload = True
             else:
-                for adapter in self.last_lora_adapters:
+                for adapter in self.loras.keys():
                     if adapter not in request.LoraAdapters:
                         self.needs_reload = True
                         break
             if self.needs_reload:
                 self.loras = {}
-                self.last_lora_adapters = request.LoraAdapters
                 if len(request.LoraAdapters) > 0:
                     i = 0
                     for adapter in request.LoraAdapters:
@@ -125,10 +122,11 @@ class BackendServicer(backend_pb2_grpc.BackendServicer):
         if not self.is_loaded or self.needs_reload:
             kill_process()
             nproc_per_node = torch.cuda.device_count()
+            # LoRAs will error loading with nproc_per_node > 2
+            if len(self.loras) > 1 and nproc_per_node > 2:
+                nproc_per_node = 2
             self.last_height = request.height
             self.last_width = request.width
-
-            CFG_ARGS = ""
 
             pipeline_type = "SD"
             sdxl_model_names_lower = ["sdxl", "_xl", "-xl", " xl"]
@@ -139,33 +137,29 @@ class BackendServicer(backend_pb2_grpc.BackendServicer):
             if "XL" in self.last_model_path:
                 pipeline_type = "SDXL"
 
-            scheduler = self.last_scheduler
-            if scheduler is None or len(scheduler) == 0:
-                scheduler = "dpmpp_2m"
-
-            # enable for more vram usage, and slower
-            # best to leave this disabled
-            no_split_batch = False
-            if no_split_batch:
-                CFG_ARGS = '--no_split_batch'
-
             cmd = [
                 'torchrun',
                 f'--nproc_per_node={nproc_per_node}',
+                f'--master-port={MASTER_PORT}',
                 'host.py',
 
+                f'--port={PORT}',
+                '--host_mode=localai',
                 f'--model_path={self.last_model_path}',
                 f'--pipeline_type={pipeline_type}',
                 f'--variant={self.variant}',
                 f'--height={self.last_height}',
                 f'--width={self.last_width}',
-                f'--scheduler={scheduler}',
-                f'--guidance_scale={self.last_cfg_scale}',
                 f'--no_cuda_graph',
                 f'--warmup_steps={WARMUP_STEPS}',
                 '--parallelism=patch',
-                CFG_ARGS,
             ]
+
+            # enable for more vram usage, and slower
+            # best to leave this disabled
+            no_split_batch = False
+            if no_split_batch:
+                cmd.append('--no_split_batch')
 
             if COMPEL:
                 cmd.append('--compel')
@@ -173,16 +167,19 @@ class BackendServicer(backend_pb2_grpc.BackendServicer):
             if len(self.loras) > 0:
                 cmd.append(f'--lora={json.dumps(self.loras)}')
 
+            if self.last_scheduler is not None and len(self.last_scheduler) > 0:
+                cmd.append(f'--scheduler={self.last_scheduler}')
+
             if self.is_low_vram:
                 # cmd.append('--enable_model_cpu_offload')          # breaks parallelism
                 # cmd.append('--enable_sequential_cpu_offload')     # crash
                 cmd.append('--enable_tiling')
                 cmd.append('--enable_slicing')
+                cmd.append('--xformers_efficient')
 
-            cmd = [arg for arg in cmd if arg]
             global process
             process = subprocess.Popen(cmd)
-            initialize_url = "http://localhost:6000/initialize"
+            initialize_url = f"{URL}/initialize"
             time_elapsed = 0
             while True:
                 try:
@@ -200,7 +197,7 @@ class BackendServicer(backend_pb2_grpc.BackendServicer):
                     return backend_pb2.Result(message=f"Failed to launch host within {HOST_INIT_TIMEOUT} seconds", success=False)
 
         if self.is_loaded:
-            url = 'http://localhost:6000/generate'
+            url = f"{URL}/generate"
             data = {
                 "positive_prompt": request.positive_prompt,
                 "num_inference_steps": request.step,
